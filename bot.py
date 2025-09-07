@@ -9,6 +9,8 @@ import asyncio
 import re
 
 user_sessions = {}
+status_messages = {}
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привет! Меня зовут Лариса. Ты можешь отправить мне любые вопросы, и я отвечу на них.")
 # Для обработки длинных сообщений
@@ -18,6 +20,13 @@ async def split_long_message(text: str, max_length: int = 4096):
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     user_message = update.message.text
+    chat_id = update.message.chat_id
+
+     # Отправляем сообщение о генерации ответа
+    status_message = await update.message.reply_text(
+        "⏳ *Ответ генерируется. Пожалуйста, подождите..*",
+        parse_mode=ParseMode.MARKDOWN
+    )
     # Получаем историю диалога пользователя
     if user_id not in user_sessions:
         user_sessions[user_id] = []
@@ -26,6 +35,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Показываем индикатор "печатает"
     await update.message.chat.send_action(action=ChatAction.TYPING)
+
+    # Сохраняем ID статусного сообщения для последующего удаления
+    status_messages[user_id] = {
+        'message_id': status_message.message_id,
+        'chat_id': chat_id,
+        'active': True
+    }
+    
+     # Запускаем анимацию загрузки
+    loading_task = asyncio.create_task(show_loading_animation(update, chat_id, user_id))
     
     # Формируем запрос к OpenRouter API
     headers = {
@@ -46,9 +65,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lambda: requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers=headers,
-                data=json.dumps(payload)
+                data=json.dumps(payload),
+                timeout=30
             )
         )
+
+         # Помечаем анимацию как неактивную
+        if user_id in status_messages:
+            status_messages[user_id]['active'] = False
+        
+        # Даем анимации немного времени для завершения
+        await asyncio.sleep(0.5)
+
+        # Удаляем статусное сообщение
+        if user_id in status_messages:
+            try:
+                await context.bot.delete_message(
+                    chat_id=chat_id, 
+                    message_id=status_messages[user_id]['message_id']
+                )
+            except:
+                pass  # Игнорируем ошибки удаления сообщения
+            finally:
+                del status_messages[user_id]
         
         if response.status_code == 200:
             ai_response = response.json()['choices'][0]['message']['content']
@@ -71,6 +110,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(error_msg, parse_mode=ParseMode.MARKDOWN)
             
     except Exception as e:
+        # Помечаем анимацию как неактивную в случае ошибки
+        if user_id in status_messages:
+            status_messages[user_id]['active'] = False
+        
+        # Даем анимации немного времени для завершения
+        await asyncio.sleep(0.5)
+        
+        # Удаляем статусное сообщение
+        if user_id in status_messages:
+            try:
+                await context.bot.delete_message(
+                    chat_id=chat_id, 
+                    message_id=status_messages[user_id]['message_id']
+                )
+            except:
+                pass
+            finally:
+                del status_messages[user_id]
+
         await update.message.reply_text(f"❌ Произошла ошибка: `{str(e)}`", parse_mode=ParseMode.MARKDOWN)
 
 async def send_formatted_message(update, text):
@@ -104,6 +162,43 @@ async def send_formatted_message(update, text):
         except BadRequest:
             await update.message.reply_text(text)
 
+async def show_loading_animation(update: Update, chat_id: int, user_id: int):
+    """Показывает анимацию загрузки, обновляя сообщение каждые 1.5 секунды"""
+    loading_frames = [
+        "⏳ *Ответ генерируется. Пожалуйста, подождите..*",
+        "⏳ *Ответ генерируется. Пожалуйста, подождите...*",
+        "⏳ *Ответ генерируется. Пожалуйста, подождите....*",
+        "⏳ *Ответ генерируется. Пожалуйста, подождите.....*"
+    ]
+    
+    frame_index = 0
+    
+    while user_id in status_messages and status_messages[user_id]['active']:
+        try:
+            # Обновляем сообщение с новым кадром анимации
+            await update.get_bot().edit_message_text(
+                chat_id=chat_id,
+                message_id=status_messages[user_id]['message_id'],
+                text=loading_frames[frame_index],
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
+            # Переходим к следующему кадру
+            frame_index = (frame_index + 1) % len(loading_frames)
+        except BadRequest as e:
+            if "message not modified" in str(e).lower():
+                # Игнорируем ошибку "message not modified"
+                pass
+            else:
+                # Для других ошибок прерываем анимацию
+                break
+        except Exception as e:
+            # Для других исключений прерываем анимацию
+            break
+        
+        # Ждем перед следующим обновлением
+        await asyncio.sleep(1.5)
+
 def format_ai_response(text):
     # Заменяем Markdown-разметку на Telegram-совместимую
     text = re.sub(r'### (.*?)', r'🟢 *\1*', text)  # Заголовки третьего уровня
@@ -112,7 +207,7 @@ def format_ai_response(text):
     text = re.sub(r'_(.*?)_', r'_\1_', text)       # Курсив
     
     # Добавляем эмодзи для списков
-    text = re.sub(r'^\* (.*?)$', r'🐾 \1', text, flags=re.MULTILINE)
+    text = re.sub(r'^\* (.*?)$', r'👉 \1', text, flags=re.MULTILINE)
     text = re.sub(r'^• (.*?)$', r'✨ \1', text, flags=re.MULTILINE)
     
     # Добавляем разделители
